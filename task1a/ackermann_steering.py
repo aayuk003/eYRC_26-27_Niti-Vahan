@@ -59,18 +59,47 @@ def ackermann_wheel_angles(delta):
     Returns:
     ---
     `left_angle`  : [ float ]
+        Left front-wheel steering angle in radians.
+
     `right_angle` : [ float ]
-        The two real front-wheel steering angles, in radians, using the
-        same sign convention as delta.
+        Right front-wheel steering angle in radians, using the same
+        sign convention as delta.
 
     REMEMBER:
     ---
-    WHEEL_OFFSET changes the effective half-track width inside each wheel's triangle.
+    WHEEL_OFFSET changes the effective half-track width inside each
+    wheel's triangle.
     '''
 
+    # Straight-line motion
+    if abs(delta) < 1e-9:
+        return 0.0, 0.0
+
+    # Effective half-track width
+    half_track = (TRACK_WIDTH / 2.0) - WHEEL_OFFSET
+
+    # Turning radius of the virtual centred wheel
+    R = WHEELBASE / np.tan(abs(delta))
+
+    # Inner and outer turning radii
+    R_inner = R - half_track
+    R_outer = R + half_track
+
+    # Corresponding wheel steering angles
+    inner_angle = np.arctan2(WHEELBASE, R_inner)
+    outer_angle = np.arctan2(WHEELBASE, R_outer)
+
+    # Preserve the sign convention of delta
+    if delta > 0:
+        # Positive delta -> left turn
+        left_angle = inner_angle
+        right_angle = outer_angle
+    else:
+        # Negative delta -> right turn
+        left_angle = -outer_angle
+        right_angle = -inner_angle
 
     return left_angle, right_angle
-
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
