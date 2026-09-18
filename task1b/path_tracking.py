@@ -33,6 +33,7 @@ import queue
 import sys
 import threading
 import time
+import numpy as np
 ##############################################################
 
 
@@ -67,51 +68,219 @@ def ackermann_wheel_angles(delta):
     `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
     '''
 
-    left_wheel_angle = 0
-    right_wheel_angle = 0
+    if abs(delta) < 1e-9:
+            return 0.0, 0.0
+    
+    R = WHEELBASE / np.tan(abs(delta))
 
-    return left_wheel_angle, right_wheel_angle
+    half_track = TRACK_WIDTH / 2.0
+
+    R_inner = R - half_track
+    R_outer = R + half_track
+
+    inner_angle = np.arctan2(WHEELBASE, R_inner)
+    outer_angle = np.arctan2(WHEELBASE, R_outer)
+
+    if delta > 0:
+        left_angle = inner_angle
+        right_angle = outer_angle
+    else:
+        left_angle = -outer_angle
+        right_angle = -inner_angle
+
+    return left_angle, right_angle
+
 
 
 def compute_steering(target_y, current_values):
     '''
     Purpose:
     ---
-    Compute the steering angle that drives the vehicle to `target_y` and keeps
-    it there. Called once per simulation step.
+    Compute the steering angle that drives the vehicle to `target_y`
+    and keeps it there.
+
+    The controller uses:
+        1. Lateral PID
+        2. Yaw damping
+        3. Soft steering reduction near the target lane
 
     Input Arguments:
     ---
-    `target_y` :        [ float ]
-        Lateral position to converge to, in metres - see LANE_Y below.
+    `target_y` :          [ float ]
+        Lateral position to converge to, in metres.
 
-    `current_values` :  [ dict ]
+    `current_values` :    [ dict ]
         {
-            "y"     : float,  current lateral position of the vehicle, in metres
-            "yaw"   : float,  current heading in radians, 0.0 when aligned with the road
-            "speed" : float,  current forward speed, in m/s
-            "dt"    : float,  seconds elapsed since the previous call
-            "t"     : float,  seconds since this run started
+            "y"     : current lateral position of the vehicle, in metres
+            "yaw"   : current heading in radians
+            "speed" : current forward speed, in m/s
+            "dt"    : seconds elapsed since previous call
+            "t"     : seconds since this run started
         }
 
     Returns:
     ---
     `steering` : [ float ]
-        Steering angle in radians. Positive turns the vehicle left, which on
-        this road means toward SMALLER y.
-
-    NOTE:
-    ---
-    While you are debugging, printing or plotting from in here is fine - do
-    whatever helps you see what your controller is doing.
-
-    Before you submit, take all of it back out. The submitted function must
-    ONLY compute and return the steering angle: no print(), no plotting, and
-    no commanding the simulator - the control loop below does all of that.
+        Steering angle in radians.
+        Positive = left turn.
     '''
 
-    steering = 0
+    # ---------------------------------------------------------
+    # PID GAINS
+    # ---------------------------------------------------------
+
+    Kp = 2.5
+    Ki = 0.01
+    Kd = 1.0
+
+    # Yaw damping gain
+    KYAW = 0.45
+
+    # ---------------------------------------------------------
+    # READ CURRENT VALUES
+    # ---------------------------------------------------------
+
+    y = current_values["y"]
+    yaw = current_values["yaw"]
+    dt = current_values["dt"]
+    t = current_values["t"]
+
+    # ---------------------------------------------------------
+    # INITIALISE PERSISTENT PID STATE
+    # ---------------------------------------------------------
+
+    if not hasattr(compute_steering, "initialized"):
+
+        compute_steering.initialized = True
+
+        compute_steering.integral_error = 0.0
+        compute_steering.previous_error = 0.0
+        compute_steering.previous_target = target_y
+
+    # ---------------------------------------------------------
+    # LATERAL ERROR
+    # ---------------------------------------------------------
+
+    # Positive error means target is at larger y than vehicle.
+    #
+    # Since positive steering = LEFT
+    # and LEFT = smaller y,
+    # the final PID contribution will be given a negative sign.
+
+    error = target_y - y
+
+    # ---------------------------------------------------------
+    # RESET WHEN TARGET LANE CHANGES
+    # ---------------------------------------------------------
+
+    if target_y != compute_steering.previous_target:
+
+        # Clear accumulated error from the old lane
+        compute_steering.integral_error = 0.0
+
+        # Prevent derivative kick caused only by the
+        # instantaneous change in target_y.
+        compute_steering.previous_error = error
+
+        compute_steering.previous_target = target_y
+
+    # ---------------------------------------------------------
+    # SAFE DT
+    # ---------------------------------------------------------
+
+    if dt <= 0.0 or dt > 1.0:
+        dt = 0.05
+
+    # ---------------------------------------------------------
+    # INTEGRAL TERM
+    # ---------------------------------------------------------
+
+    compute_steering.integral_error += error * dt
+
+    # Anti-windup
+    integral_limit = 0.20
+
+    compute_steering.integral_error = max(
+        -integral_limit,
+        min(
+            integral_limit,
+            compute_steering.integral_error
+        )
+    )
+
+    # ---------------------------------------------------------
+    # DERIVATIVE TERM
+    # ---------------------------------------------------------
+
+    derivative = (
+        error - compute_steering.previous_error
+    ) / dt
+
+    # ---------------------------------------------------------
+    # LATERAL PID
+    # ---------------------------------------------------------
+
+    pid_output = (
+        Kp * error
+        + Ki * compute_steering.integral_error
+        + Kd * derivative
+    )
+
+    # ---------------------------------------------------------
+    # COMBINE LATERAL PID + YAW DAMPING
+    # ---------------------------------------------------------
+
+    # -pid_output:
+    #   Converts the target_y - current_y error convention
+    #   into the required steering direction.
+    #
+    # -KYAW * yaw:
+    #   Damps unwanted vehicle rotation and helps the vehicle
+    #   straighten itself after a lane change.
+
+    steering = -pid_output - KYAW * yaw
+
+    # ---------------------------------------------------------
+    # SOFT ZONE
+    # ---------------------------------------------------------
+
+    # Reduce steering as the vehicle gets close to the
+    # desired lane. This helps prevent overshoot.
+
+    distance = abs(error)
+
+    if distance < 0.05:
+        steering *= 0.65
+
+    if distance < 0.025:
+        steering *= 0.40
+
+    if distance < 0.010:
+        steering *= 0.20
+
+    # ---------------------------------------------------------
+    # CONTROLLER STEERING LIMIT
+    # ---------------------------------------------------------
+
+    MAX_CONTROLLER_STEER = math.radians(18.0)
+
+    steering = max(
+        -MAX_CONTROLLER_STEER,
+        min(
+            MAX_CONTROLLER_STEER,
+            steering
+        )
+    )
+
+    # ---------------------------------------------------------
+    # UPDATE PREVIOUS ERROR
+    # ---------------------------------------------------------
+
+    compute_steering.previous_error = error
+
     return steering
+
+
 
 
 ##############################################################
