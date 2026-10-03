@@ -33,14 +33,13 @@ import queue
 import sys
 import threading
 import time
-import numpy as np
 ##############################################################
 
 
 #################### VEHICLE CONSTANTS #######################
-WHEELBASE = 0.120           # L: distance between front and rear axle centrelines
-TRACK_WIDTH = 0.110         # W: distance between left and right wheel centre
-WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
+WHEELBASE = 0.120
+TRACK_WIDTH = 0.110
+WHEEL_OFFSET = 0.0275
 ##############################################################
 
 
@@ -48,240 +47,69 @@ WHEEL_OFFSET = 0.0275       # O: distance between kingpin axis and wheel centre.
 ############### ADD YOUR IMPLEMENTATION HERE #################
 ##############################################################
 
+# Controller state
+previous_error = 0.0
+
 
 def ackermann_wheel_angles(delta):
-    '''
-    Purpose:
-    ---
-    Convert one desired steering angle into the two real front-wheel angles
-    the vehicle's Ackermann geometry implies.
-
-    Input Arguments:
-    ---
-    `delta` :          [ float ]
-        Desired steering angle in radians, as if the vehicle had a single
-        centred front wheel. Positive means turning left.
-
-    Returns:
-    ---
-    `left_wheel_angle`  : [ float ]  angle for the left front wheel, radians
-    `right_wheel_angle` : [ float ]  angle for the right front wheel, radians
-    '''
-
     if abs(delta) < 1e-9:
-            return 0.0, 0.0
-    
-    R = WHEELBASE / np.tan(abs(delta))
+        return 0.0, 0.0
 
+    R = WHEELBASE / math.tan(abs(delta))
     half_track = TRACK_WIDTH / 2.0
 
     R_inner = R - half_track
     R_outer = R + half_track
 
-    inner_angle = np.arctan2(WHEELBASE, R_inner)
-    outer_angle = np.arctan2(WHEELBASE, R_outer)
+    inner_angle = math.atan2(WHEELBASE, R_inner)
+    outer_angle = math.atan2(WHEELBASE, R_outer)
 
     if delta > 0:
-        left_angle = inner_angle
-        right_angle = outer_angle
-    else:
-        left_angle = -outer_angle
-        right_angle = -inner_angle
+        return inner_angle, outer_angle
 
-    return left_angle, right_angle
-
+    return -outer_angle, -inner_angle
 
 
 def compute_steering(target_y, current_values):
-    '''
-    Purpose:
-    ---
-    Compute the steering angle that drives the vehicle to `target_y`
-    and keeps it there.
-
-    The controller uses:
-        1. Lateral PID
-        2. Yaw damping
-        3. Soft steering reduction near the target lane
-
-    Input Arguments:
-    ---
-    `target_y` :          [ float ]
-        Lateral position to converge to, in metres.
-
-    `current_values` :    [ dict ]
-        {
-            "y"     : current lateral position of the vehicle, in metres
-            "yaw"   : current heading in radians
-            "speed" : current forward speed, in m/s
-            "dt"    : seconds elapsed since previous call
-            "t"     : seconds since this run started
-        }
-
-    Returns:
-    ---
-    `steering` : [ float ]
-        Steering angle in radians.
-        Positive = left turn.
-    '''
-
-    # ---------------------------------------------------------
-    # PID GAINS
-    # ---------------------------------------------------------
-
-    Kp = 2.5
-    Ki = 0.01
-    Kd = 1.0
-
-    # Yaw damping gain
-    KYAW = 0.45
-
-    # ---------------------------------------------------------
-    # READ CURRENT VALUES
-    # ---------------------------------------------------------
+    global previous_error
 
     y = current_values["y"]
     yaw = current_values["yaw"]
+    speed = current_values["speed"]
     dt = current_values["dt"]
-    t = current_values["t"]
 
-    # ---------------------------------------------------------
-    # INITIALISE PERSISTENT PID STATE
-    # ---------------------------------------------------------
+    # Cross-track error
+    error = y - target_y
 
-    if not hasattr(compute_steering, "initialized"):
+    # Desired road heading is zero
+    heading_error = -yaw
 
-        compute_steering.initialized = True
+    # Derivative damping
+    if dt > 0.0:
+        derivative_error = (error - previous_error) / dt
+    else:
+        derivative_error = 0.0
 
-        compute_steering.integral_error = 0.0
-        compute_steering.previous_error = 0.0
-        compute_steering.previous_target = target_y
+    previous_error = error
 
-    # ---------------------------------------------------------
-    # LATERAL ERROR
-    # ---------------------------------------------------------
+    # Stanley controller
+    v = max(abs(speed), 0.05)
 
-    # Positive error means target is at larger y than vehicle.
-    #
-    # Since positive steering = LEFT
-    # and LEFT = smaller y,
-    # the final PID contribution will be given a negative sign.
+    K_stanley = 1.3
+    Kd = 0.3
 
-    error = target_y - y
-
-    # ---------------------------------------------------------
-    # RESET WHEN TARGET LANE CHANGES
-    # ---------------------------------------------------------
-
-    if target_y != compute_steering.previous_target:
-
-        # Clear accumulated error from the old lane
-        compute_steering.integral_error = 0.0
-
-        # Prevent derivative kick caused only by the
-        # instantaneous change in target_y.
-        compute_steering.previous_error = error
-
-        compute_steering.previous_target = target_y
-
-    # ---------------------------------------------------------
-    # SAFE DT
-    # ---------------------------------------------------------
-
-    if dt <= 0.0 or dt > 1.0:
-        dt = 0.05
-
-    # ---------------------------------------------------------
-    # INTEGRAL TERM
-    # ---------------------------------------------------------
-
-    compute_steering.integral_error += error * dt
-
-    # Anti-windup
-    integral_limit = 0.20
-
-    compute_steering.integral_error = max(
-        -integral_limit,
-        min(
-            integral_limit,
-            compute_steering.integral_error
-        )
+    lateral_correction = math.atan2(
+        K_stanley * error,
+        v
     )
 
-    # ---------------------------------------------------------
-    # DERIVATIVE TERM
-    # ---------------------------------------------------------
-
-    derivative = (
-        error - compute_steering.previous_error
-    ) / dt
-
-    # ---------------------------------------------------------
-    # LATERAL PID
-    # ---------------------------------------------------------
-
-    pid_output = (
-        Kp * error
-        + Ki * compute_steering.integral_error
-        + Kd * derivative
+    steering = (
+        heading_error
+        + lateral_correction
+        + Kd * derivative_error
     )
 
-    # ---------------------------------------------------------
-    # COMBINE LATERAL PID + YAW DAMPING
-    # ---------------------------------------------------------
-
-    # -pid_output:
-    #   Converts the target_y - current_y error convention
-    #   into the required steering direction.
-    #
-    # -KYAW * yaw:
-    #   Damps unwanted vehicle rotation and helps the vehicle
-    #   straighten itself after a lane change.
-
-    steering = -pid_output - KYAW * yaw
-
-    # ---------------------------------------------------------
-    # SOFT ZONE
-    # ---------------------------------------------------------
-
-    # Reduce steering as the vehicle gets close to the
-    # desired lane. This helps prevent overshoot.
-
-    distance = abs(error)
-
-    if distance < 0.05:
-        steering *= 0.65
-
-    if distance < 0.025:
-        steering *= 0.40
-
-    if distance < 0.010:
-        steering *= 0.20
-
-    # ---------------------------------------------------------
-    # CONTROLLER STEERING LIMIT
-    # ---------------------------------------------------------
-
-    MAX_CONTROLLER_STEER = math.radians(18.0)
-
-    steering = max(
-        -MAX_CONTROLLER_STEER,
-        min(
-            MAX_CONTROLLER_STEER,
-            steering
-        )
-    )
-
-    # ---------------------------------------------------------
-    # UPDATE PREVIOUS ERROR
-    # ---------------------------------------------------------
-
-    compute_steering.previous_error = error
-
-    return steering
-
-
-
+    return float(steering)
 
 ##############################################################
 ################ END OF YOUR IMPLEMENTATION ##################
@@ -296,15 +124,15 @@ STEER_RIGHT_JOINT = "/Niti_Vahan/steeringRight"
 DRIVE_LEFT_JOINT = "/Niti_Vahan/motorLeft"
 DRIVE_RIGHT_JOINT = "/Niti_Vahan/motorRight"
 
-WHEEL_RATE = 1.3                        # rad/s, constant drive speed
-MAX_STEER = math.radians(30.0)          # steering limit, radians
-RUN_TIME = 120.0                        # s of simulated time, every run
+WHEEL_RATE = 1.3
+MAX_STEER = math.radians(30.0)
+RUN_TIME = 120.0
 
 # The vehicle drives along world -x, so its left-hand side faces -y.
 LANE_Y = {"L": 0.0, "R": 0.2}
 DEFAULT_LANE = "L"
 DEFAULT_CSV = "trajectory.csv"
-DEFAULT_LOG_RATE = 10.0                 # Hz, rows written to the CSV
+DEFAULT_LOG_RATE = 10.0
 
 CSV_COLUMNS = ("t", "x", "y", "yaw", "speed", "target_y",
                "steering", "left_wheel", "right_wheel")
@@ -314,7 +142,7 @@ def _stdin_reader(commands):
     '''Read the terminal in a background thread so the control loop never blocks.'''
     for line in sys.stdin:
         commands.put(line.strip())
-    commands.put("q")           # stdin closed - treat it as "stop"
+    commands.put("q")
 
 
 def read_target(commands, lane):
@@ -426,6 +254,7 @@ def run_session(sim, commands, csv_path, log_rate, schedule=None):
                 "dt": dt,
                 "t": elapsed,
             })
+
             steering = max(-MAX_STEER, min(MAX_STEER, steering))
             left_angle, right_angle = ackermann_wheel_angles(steering)
 
@@ -436,17 +265,24 @@ def run_session(sim, commands, csv_path, log_rate, schedule=None):
 
             if elapsed >= next_log:
                 writer.writerow([
-                    "%.3f" % elapsed, "%.4f" % pos[0], "%.4f" % pos[1],
-                    "%.4f" % yaw, "%.4f" % math.hypot(linear[0], linear[1]),
-                    "%.2f" % target_y, "%.4f" % steering,
-                    "%.4f" % left_angle, "%.4f" % right_angle,
+                    "%.3f" % elapsed,
+                    "%.4f" % pos[0],
+                    "%.4f" % pos[1],
+                    "%.4f" % yaw,
+                    "%.4f" % math.hypot(linear[0], linear[1]),
+                    "%.2f" % target_y,
+                    "%.4f" % steering,
+                    "%.4f" % left_angle,
+                    "%.4f" % right_angle,
                 ])
                 rows += 1
                 next_log += log_interval
 
             sim.step()
+
     except KeyboardInterrupt:
         print("interrupted")
+
     finally:
         handle.close()
         sim.stopSimulation()
@@ -461,11 +297,14 @@ def main():
         description="Task 1B - drive the Ackermann vehicle to the lane you ask for."
     )
     parser.add_argument(
-        "--out", default=DEFAULT_CSV,
+        "--out",
+        default=DEFAULT_CSV,
         help="Where to write the trajectory CSV (default: %s)." % DEFAULT_CSV,
     )
     parser.add_argument(
-        "--log-rate", type=float, default=DEFAULT_LOG_RATE,
+        "--log-rate",
+        type=float,
+        default=DEFAULT_LOG_RATE,
         help="Rows per second written to the CSV (default: %g Hz)." % DEFAULT_LOG_RATE,
     )
     parser.add_argument(
@@ -484,16 +323,22 @@ def main():
 
     commands = queue.Queue()
     if schedule:
-        # No terminal reader: the schedule is the only thing that may change lane.
         print("lane %s (y = %.2f m) - fixed schedule: %s"
               % (DEFAULT_LANE, LANE_Y[DEFAULT_LANE],
                  ", ".join("%gs->%s" % entry for entry in schedule)))
     else:
-        threading.Thread(target=_stdin_reader, args=(commands,), daemon=True).start()
-        print("lane %s (y = %.2f m) - type L or R and press Enter to change lane, q to stop"
-              % (DEFAULT_LANE, LANE_Y[DEFAULT_LANE]))
+        threading.Thread(
+            target=_stdin_reader,
+            args=(commands,),
+            daemon=True
+        ).start()
 
-    rows = run_session(sim, commands, args.out, args.log_rate, schedule)
+        print(
+            "lane %s (y = %.2f m) - type L or R and press Enter to change lane, q to stop"
+            % (DEFAULT_LANE, LANE_Y[DEFAULT_LANE])
+        )
+
+    rows = run_session(sim, commands, args.out, DEFAULT_LOG_RATE, schedule)
     print("wrote %d rows to %s" % (rows, args.out))
 
 
